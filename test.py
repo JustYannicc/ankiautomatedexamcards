@@ -1,80 +1,75 @@
-import re
-from pdfminer.high_level import extract_pages
-from pdfminer.layout import LAParams, LTTextBoxHorizontal
-from fuzzywuzzy import fuzz
 import PyPDF2
+import pytesseract
+from PIL import Image
 from pdf2image import convert_from_path
+import re
+import os
+import logging
+from fuzzywuzzy import fuzz
 
-def extract_questions_from_pdf(pdf_path):
-    with open(pdf_path, 'rb') as file:
-        # Initialize PDF reader
-        pdf_reader = PyPDF2.PdfReader(file)
-        num_pages = len(pdf_reader.pages)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Modify the find_question_boundaries function to not only find boundaries but also return the total number of questions
+def find_question_boundaries_and_count(text):
+    logging.info("Identifying question boundaries...")
+    matches = re.findall(r"\b(\d+)\b(.*?)(\(Total for Question \1 is \d+ marks\))", text, re.DOTALL)
+    # Filter out any matches that don't have three elements
+    valid_matches = [match for match in matches if len(match) == 3]
+    total_questions = len(valid_matches)  # Count of total questions
+    return valid_matches, total_questions
+
+def extract_questions_from_pdf(pdf_path, output_dir):
+    logging.info("Starting extraction process...")
+    
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # Convert the entire PDF to images
+    logging.info("Converting PDF pages to images...")
+    images = convert_from_path(pdf_path)
+
+    next_expected_question_number = 1  # Start with question number 1
+
+    for idx, img in enumerate(images):
+        logging.info(f"Processing page {idx + 1}...")
+        img_text = pytesseract.image_to_string(img)
+
+        # Limit the search to the leftmost 1/4 of the page
+        quarter_width = img.width // 4
+        limited_img = img.crop((0, 0, quarter_width, img.height))
+        limited_data = pytesseract.image_to_data(limited_img, output_type=pytesseract.Output.DICT)
+
+        # Debugging: Print the detected text from the leftmost 1/4 of the page
+        logging.info(f"Detected text in left 1/4: {limited_data['text']}")
+
+        # Extract all question numbers from the leftmost 1/4 of the page
+        question_starts = [i for i, text in enumerate(limited_data['text']) if text.strip() == str(next_expected_question_number)]
         
-        # Extract text from all pages of the PDF
-        text = ''
-        for page_num in range(num_pages):
-            page = pdf_reader.pages[page_num]
-            text += page.extract_text()
+        logging.info(f"Detected starts for questions: {question_starts}")  # Debugging
         
-        # Search for questions using regular expressions
-        start_pattern = r'\b(\d+)\b(?=\sFind)'
-        end_pattern = r'Total for Question (\d+) is (\d+) marks'
-        
-        questions = []
-        for start_match, end_match in zip(re.finditer(start_pattern, text), re.finditer(end_pattern, text)):
-            question_text = text[start_match.start():end_match.end()]
-            questions.append(question_text)
-        
-        return questions
+        if not question_starts:  # If the expected question number is not found, move to the next page
+            continue
 
+        for i, start_index in enumerate(question_starts):
+            x_start, y_start = limited_data['left'][start_index], limited_data['top'][start_index]
+            
+            # Determine the end y-coordinate based on the next question start or the bottom of the image
+            if i < len(question_starts) - 1:
+                y_end = limited_data['top'][question_starts[i + 1]]
+            else:
+                y_end = img.height
+            
+            # Extract the region for the current question
+            x_end = img.width  # Capture till the end of the width
+            question_img = img.crop((x_start - 10, y_start - 40, x_end, y_end))
+            
+            path = os.path.join(output_dir, f"question {next_expected_question_number}.png")
+            question_img.save(path)
+            logging.info(f"Saved question {next_expected_question_number} to {path}")
 
-def get_text_coordinates(pdf_path, search_text, threshold=90):
-    for page_layout in extract_pages(pdf_path, laparams=LAParams()):
-        for element in page_layout:
-            if isinstance(element, LTTextBoxHorizontal):
-                current_text = element.get_text().strip()
-                lines = current_text.split("\n")
-                for line in lines:
-                    # Using fuzz partial ratio to get a score for the match
-                    if fuzz.partial_ratio(line, search_text) > threshold:
-                        return (element.x0, element.y0, element.x1, element.y1)
-    return None
+            next_expected_question_number += 1  # Prepare for the next question
 
-def extract_question_from_pdf(pdf_path, coords, output_image_path):
-    """
-    Extracts a section of the PDF using the provided coordinates and saves it as an image.
-
-    Parameters:
-    - pdf_path (str): Path to the PDF file.
-    - coords (tuple): Bounding box coordinates in the format (x0, y0, x1, y1).
-    - output_image_path (str): Path to save the extracted image.
-    """
-
-    # Convert the PDF page to an image
-    dpi_val = 300
-    images = convert_from_path(pdf_path, dpi=dpi_val)
-    page_image = images[0]
-
-    # Compute the scaling factor
-    pdf_width_points = 595.0  # typical width for A4 in points
-    pdf_height_points = 842.0  # typical height for A4 in points
-    scale_x = page_image.width / pdf_width_points
-    scale_y = page_image.height / pdf_height_points
-
-    # Adjust the coordinates using the scaling factor
-    x0, y0, x1, y1 = coords
-    x0_scaled, x1_scaled = x0 * scale_x, x1 * scale_x
-    y0_scaled, y1_scaled = y0 * scale_y, y1 * scale_y
-
-    # Crop the image using the adjusted coordinates
-    cropped_image = page_image.crop((x0_scaled, y0_scaled, x1_scaled, y1_scaled))
-
-    # Save the cropped image
-    cropped_image.save(output_image_path, "PNG")
-
-# Example usage:
-pdf_path = "exampaper.pdf"
-coords = (70.87010000000001, 723.8829999999999, 374.31409999999994, 736.135)  # Example coordinates
-output_image_path = "question_image.png"
-extract_question_from_pdf(pdf_path, coords, output_image_path)
+# Usage:
+pdf_path = 'exampaper.pdf'
+output_dir = 'images'
+extract_questions_from_pdf(pdf_path, output_dir)
